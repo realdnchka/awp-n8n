@@ -8,25 +8,24 @@
         "responseMode": "responseNode",
         "options": {}
       },
-      "id": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0001",
+      "id": "11111111-1111-1111-1111-111111110001",
       "name": "Webhook",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 2,
-      "position": [260, 300],
-      "webhookId": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0001"
+      "position": [260, 300]
     },
     {
       "parameters": {
         "operation": "read",
         "fileSelector": "/home/node/awp-agents/README.md",
-        "dataPropertyName": "prompt",
+        "dataPropertyName": "agentsFile",
         "options": {}
       },
-      "id": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0002",
-      "name": "Read awp-agents README",
+      "id": "11111111-1111-1111-1111-111111110002",
+      "name": "Read awp-agents file",
       "type": "n8n-nodes-base.readWriteFile",
       "typeVersion": 1,
-      "position": [520, 220]
+      "position": [520, 300]
     },
     {
       "parameters": {
@@ -34,56 +33,36 @@
         "url": "http://echo-mcp:8800/echo",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"text\": \"from n8n\",\n  \"data\": $json.body\n}",
+        "jsonBody": "={\n  \"text\": \"from n8n\",\n  \"data\": $('Webhook').item.json.body\n}",
         "options": {}
       },
-      "id": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0003",
-      "name": "Call echo-mcp /echo",
+      "id": "11111111-1111-1111-1111-111111110003",
+      "name": "Call echo-mcp",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [520, 380]
-    },
-    {
-      "parameters": {
-        "mode": "combine",
-        "combineBy": "combineByPosition",
-        "options": {}
-      },
-      "id": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0004",
-      "name": "Merge",
-      "type": "n8n-nodes-base.merge",
-      "typeVersion": 3,
-      "position": [800, 300]
+      "position": [780, 300]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={\n  \"agents_file_bytes\": ($items(\"Read awp-agents README\")[0].binary && $items(\"Read awp-agents README\")[0].binary.prompt && $items(\"Read awp-agents README\")[0].binary.prompt.fileSize) || null,\n  \"agents_file_name\": ($items(\"Read awp-agents README\")[0].binary && $items(\"Read awp-agents README\")[0].binary.prompt && $items(\"Read awp-agents README\")[0].binary.prompt.fileName) || null,\n  \"echo_mcp\": $items(\"Call echo-mcp /echo\")[0].json\n}",
+        "responseBody": "={{ { agents_file_name: $('Read awp-agents file').item.binary.agentsFile.fileName, agents_file_bytes: $('Read awp-agents file').item.binary.agentsFile.fileSize, echo_mcp: $('Call echo-mcp').item.json } }}",
         "options": {}
       },
-      "id": "5d6a9f7e-2a01-4a6c-8e7e-1f00aaaa0005",
+      "id": "11111111-1111-1111-1111-111111110004",
       "name": "Respond",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
-      "position": [1060, 300]
+      "position": [1040, 300]
     }
   ],
   "connections": {
     "Webhook": {
-      "main": [
-        [
-          { "node": "Read awp-agents README", "type": "main", "index": 0 },
-          { "node": "Call echo-mcp /echo", "type": "main", "index": 0 }
-        ]
-      ]
+      "main": [[{ "node": "Read awp-agents file", "type": "main", "index": 0 }]]
     },
-    "Read awp-agents README": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 0 }]]
+    "Read awp-agents file": {
+      "main": [[{ "node": "Call echo-mcp", "type": "main", "index": 0 }]]
     },
-    "Call echo-mcp /echo": {
-      "main": [[{ "node": "Merge", "type": "main", "index": 1 }]]
-    },
-    "Merge": {
+    "Call echo-mcp": {
       "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
     }
   },
