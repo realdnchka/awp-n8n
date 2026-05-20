@@ -1,0 +1,37 @@
+name: awp-n8n
+
+# Local dev overlay. The three AWP repos sit next to each other on disk:
+#
+#   ~/Dev/ai/awp/
+#     ├── awp-n8n/    <- you are here
+#     ├── awp-agents/ (artifacts: skills, prompts, role configs)
+#     └── awp-mcp/    (MCP servers, e.g. echo-mcp)
+#
+# This overlay does two things:
+#   1. Mounts ../awp-agents read-only into the n8n container so workflows can
+#      read skills/prompts directly from the filesystem.
+#   2. Builds and starts the local MCP servers from ../awp-mcp on the shared
+#      `awp` network.
+#
+# Usage from the awp-n8n directory:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Once awp-agents/awp-mcp become git submodules under ./submodules/, switch
+# the paths to ./submodules/awp-agents and ./submodules/awp-mcp/... .
+
+services:
+  n8n:
+    volumes:
+      - ../awp-agents:/home/node/awp-agents:ro
+    depends_on:
+      - echo-mcp
+
+  echo-mcp:
+    build: ../awp-mcp/servers/echo-mcp
+    image: awp-mcp/echo-mcp:dev
+    container_name: awp-echo-mcp
+    restart: unless-stopped
+    environment:
+      ECHO_MCP_ADDR: ":8800"
+    networks:
+      - awp
