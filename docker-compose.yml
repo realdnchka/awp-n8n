@@ -10,7 +10,6 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       GENERIC_TIMEZONE: ${TZ:-UTC}
-      N8N_RUNNERS_ENABLED: "true"
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_HOST: ${N8N_HOST:-localhost}
       N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
