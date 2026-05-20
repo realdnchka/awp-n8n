@@ -33,7 +33,7 @@
         "url": "http://echo-mcp:8800/echo",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n  \"text\": \"from n8n\",\n  \"data\": $('Webhook').item.json.body\n}",
+        "jsonBody": "={{ JSON.stringify({ text: 'from n8n', data: $('Webhook').item.json.body }) }}",
         "options": {}
       },
       "id": "11111111-1111-1111-1111-111111110003",
