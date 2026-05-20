@@ -58,8 +58,8 @@ This assumes the three repos sit next to each other on disk:
    ```
 
    Expected: a JSON containing
-   - non-null `agents_file_name = "README.md"` and a positive `agents_file_bytes` (proves `awp-agents` is mounted and readable from a workflow), and
-   - `echo_mcp.echo.text = "from n8n"` (proves the MCP-server container is reachable).
+   - `agents_mounted: true` and `agents_file_name: "README.md"` (proves `awp-agents` is mounted and readable from a workflow), and
+   - `echo_mcp.echo.text: "from n8n"` (proves the MCP-server container is reachable).
 
 ## Switching to git submodules (later)
 

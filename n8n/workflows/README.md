@@ -26,5 +26,5 @@ This directory is mounted read-only into the n8n container at `/home/node/workfl
      -d '{"hello":"world"}' | jq
    ```
 
-   Expected: a JSON with non-null `agents_file_name = "README.md"`, a positive
-   `agents_file_bytes`, and `echo_mcp.echo.text = "from n8n"`.
+   Expected: a JSON with `agents_mounted: true`, `agents_file_name: "README.md"`,
+   and `echo_mcp.echo.text: "from n8n"`.
