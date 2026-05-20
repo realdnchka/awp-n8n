@@ -21,6 +21,11 @@ name: awp-n8n
 
 services:
   n8n:
+    environment:
+      # Allow Read/Write Files from Disk node to access the mounted awp-agents
+      # volume. Without this, n8n only permits /home/node/.n8n-files (default).
+      # Multiple paths can be separated with ';'.
+      N8N_RESTRICT_FILE_ACCESS_TO: /home/node/awp-agents
     volumes:
       - ../awp-agents:/home/node/awp-agents:ro
     depends_on:
