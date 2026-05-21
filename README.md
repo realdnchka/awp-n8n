@@ -123,11 +123,11 @@ Each automated role runs under its own **Atlassian service account** (per-role a
 
 | Role | Service account | `accountId` (recorded) | n8n credential | Comes online |
 |---|---|---|---|---|
-| `pm` | `awp-pm` | `712020:5a2a8ccc-e479-49a1-9965-2748d01d9d26` | `Jira — awp-pm` | M1 |
+| `pm` | `awp-pm` | `712020:5a2a8ccc-e479-49a1-9965-2748d01d9d26` | `jira:awp-pm` | M1 |
 | `classifier` | borrows `awp-pm` | — | — | M2 |
-| `dev` | `awp-dev` | `712020:88195866-6d79-4da8-a642-e559cd055709` | `Jira — awp-dev` | M2 |
-| `qa` | `awp-qa` | `712020:3643c5de-b750-4046-908d-0bc55051ad03` | `Jira — awp-qa` | M3 |
-| `devops` | `awp-devops` | `712020:4e757014-d33f-4d1e-acf4-1c0eb3c2848f` | `Jira — awp-devops` | M3 |
+| `dev` | `awp-dev` | `712020:88195866-6d79-4da8-a642-e559cd055709` | `jira:awp-dev` | M2 |
+| `qa` | `awp-qa` | `712020:3643c5de-b750-4046-908d-0bc55051ad03` | `jira:awp-qa` | M3 |
+| `devops` | `awp-devops` | `712020:4e757014-d33f-4d1e-acf4-1c0eb3c2848f` | `jira:awp-devops` | M3 |
 | `reviewer` | borrows `awp-dev` (default; pending confirmation) | — | — | M3 |
 
 All four service accounts are created up-front in M1 (cheap — single admin screen, no email aliases needed). The canonical mapping (workspace, accountIds, credential names) lives in `awp-agents/agents/shared/jira-accounts.yaml` — **this file is gitignored** because it contains workspace-specific identifiers. Bootstrap from the committed template:
@@ -139,7 +139,7 @@ cp jira-fields.yaml.example   jira-fields.yaml
 # edit both, replacing TODO placeholders with your values
 ```
 
-API tokens and n8n credentials are added per-role as agents come online — M1 only needs `Jira — awp-pm`.
+API tokens and n8n credentials are added per-role as agents come online — M1 only needs `jira:awp-pm`.
 
 ### Jira Cloud setup (one-time)
 
@@ -204,14 +204,19 @@ Stories filed directly are *not* picked up until Classifier ships in M2.
 
 ### n8n Credentials (one-time, in n8n UI at <http://localhost:5678>)
 
+**Credential naming convention.** Credentials follow `<type>:<scope>` lowercase, colon-separated:
+- `anthropic` — single shared Anthropic API key (no per-role split; the AI Agent node picks the model, the key is the same).
+- `jira:<role>` — one per Jira-touching role (`jira:awp-pm`, `jira:awp-dev`, …) so each agent acts under its own service account.
+- Future credentials follow the same shape: `github:<role>`, `telegram`, etc.
+
 `Credentials → Create New`:
 
-1. **`Anthropic API`** — paste API key.
-2. **`Jira — awp-pm`** (type `Jira Software Cloud API`):
+1. **`anthropic`** (type `Anthropic API`) — paste your Anthropic API key.
+2. **`jira:awp-pm`** (type `Jira Software Cloud API`):
    - `Domain` = `<workspace>.atlassian.net`
    - `Email` = the service-account email Atlassian shows on the API-token creation page (commonly `<accountId>@connect.atlassian.com`; copy exactly)
    - `API Token` = the token from step 2 above
-3. Per-role Jira credentials (`Jira — awp-dev`, `Jira — awp-qa`, `Jira — awp-devops`) are added as those roles come online in M2/M3.
+3. Per-role Jira credentials (`jira:awp-dev`, `jira:awp-qa`, `jira:awp-devops`) are added as those roles come online in M2/M3.
 
 (The n8n API key for the sidecar is a separate thing, covered in *Workflow sync* below.)
 
@@ -309,7 +314,7 @@ Then change the volume mount and build context in `docker-compose.dev.yml` from 
 ## Roadmap
 
 - **M0 — Skeleton.** Done. Smoke test passes.
-- **M1 — Jira intake + PM (Layer-1 only, no MCP added).** PM polls Epics in Backlog via `Jira Trigger` (as `awp-pm`), decomposes each Epic into ≤ 10 Stories via the native Jira node, fills the AWP custom fields (`AWP Role`, `AWP Tier`, `AWP Acceptance Criteria`, `AWP Estimated Input Tokens`, `AWP Estimated Output Tokens`) and sets `assignee` on each Story to the role's service-account `accountId`. Stories land with status `To Do` (board column 1); the Epic transitions `Backlog → In Progress`. Vague Epics get the `needs-clarification` label instead of a status change. Anthropic + `Jira — awp-pm` credentials added in n8n. Field-name mapping kept in `awp-agents/agents/shared/jira-fields.yaml`.
+- **M1 — Jira intake + PM (Layer-1 only, no MCP added).** PM polls Epics in Backlog via `Jira Trigger` (as `awp-pm`), decomposes each Epic into ≤ 10 Stories via the native Jira node, fills the AWP custom fields (`AWP Role`, `AWP Tier`, `AWP Acceptance Criteria`, `AWP Estimated Input Tokens`, `AWP Estimated Output Tokens`) and sets `assignee` on each Story to the role's service-account `accountId`. Stories land with status `To Do` (board column 1); the Epic transitions `Backlog → In Progress`. Vague Epics get the `needs-clarification` label instead of a status change. `anthropic` + `jira:awp-pm` credentials added in n8n. Field-name mapping kept in `awp-agents/agents/shared/jira-fields.yaml`.
 - **M2 — Dev happy path + Classifier + first L2 MCP.** Classifier picks up unlabeled Stories (`issuetype = Story AND "AWP Role" IS EMPTY`) via native Jira node only, fills role/tier/estimates. Dev agent (as `awp-dev`) gets the first MCP handlers (`runtime` shell sandbox + `fs` filesystem) consolidated in the single `awp-mcp` Go binary. Native GitHub node opens branch + PR + posts CI status back to Jira. Every agent writes actual tokens + computes `actual_cost_usd` from `agents/shared/pricing.yaml`.
 - **M3 — Review + Debug loops.** Reviewer + DevOps workflows, iteration limits (`debug=2`, `review=3` defaults), Telegram alerts on escalation (native Telegram node).
 - **M4 — Dispatcher.** `dispatch_loop` workflow + per-role caps from `.env`, atomic Jira status transitions. No broker.
