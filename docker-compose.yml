@@ -23,6 +23,12 @@ services:
       - ./n8n/workflows:/home/node/workflows:ro
     networks:
       - awp
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5678/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
 networks:
   awp:

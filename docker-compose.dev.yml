@@ -40,3 +40,35 @@ services:
       ECHO_MCP_ADDR: ":8800"
     networks:
       - awp
+
+  # One-shot sidecar: waits for n8n to be healthy, then syncs every workflow
+  # JSON in n8n/workflows/ via n8n's REST API (NOT via the `n8n import:workflow`
+  # CLI — see scripts/sync-workflows.js for why).
+  #
+  # First-boot bootstrap (N8N_API_KEY is initially empty):
+  #   1. docker compose up   → n8n starts; sidecar prints how to create the
+  #      API key in the UI and exits with code 0 (does nothing else).
+  #   2. http://localhost:5678 → complete owner setup, then
+  #      Settings → n8n API → Create an API key. Paste into awp-n8n/.env.
+  #   3. docker compose run --rm n8n-import   (or  docker compose up  again)
+  #      → sidecar now creates/updates/activates workflows via REST.
+  #
+  # Ad-hoc re-sync without restarting n8n:
+  #   docker compose run --rm n8n-import
+  n8n-import:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: awp-n8n-import
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      N8N_API_KEY: ${N8N_API_KEY:-}
+      N8N_URL: http://n8n:5678
+      WORKFLOWS_DIR: /workflows
+    volumes:
+      - ./n8n/workflows:/workflows:ro
+      - ./scripts/sync-workflows.js:/scripts/sync-workflows.js:ro
+    networks:
+      - awp
+    entrypoint: ["node", "/scripts/sync-workflows.js"]
+    restart: "no"
