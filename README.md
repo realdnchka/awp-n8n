@@ -80,8 +80,10 @@ The three repos sit next to each other on disk:
 2. **First boot** (n8n + echo-mcp + workflow-sync sidecar, with `awp-agents` mounted into n8n):
 
    ```bash
-   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+   docker compose up --build
    ```
+
+   `.env` sets `COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml`, so plain `docker compose ...` invocations from this directory automatically merge the dev overlay. (Without that var, services from the overlay — `n8n-import`, the `awp-agents` mount, `echo-mcp` — wouldn't be visible and `docker compose run --rm n8n-import` would fail with `no such service: n8n-import`.)
 
    On the very first boot the sidecar can't do anything yet (no `N8N_API_KEY`) — it prints a help message and exits with code 0. n8n itself is up and accessible.
 
@@ -148,25 +150,41 @@ API tokens and n8n credentials are added per-role as agents come online — M1 o
    - Grant **product access to Jira**.
    - In the Jira project: assign **Developer** role (create issues, transition, comment).
    - Copy the `accountId` and record it in `awp-agents/agents/shared/jira-accounts.yaml`.
-   - For `awp-pm` only (M1): create an **API token** on its admin page; the page also shows the `service_account_email` value to paste into n8n.
-3. **Issue type hierarchy** — `Project settings → Issue types`. Confirm **Epic**, **Story**, and **Subtask** are all enabled (defaults in any team-managed Jira project). In M1 the PM workflow watches **Epics** in Backlog and creates **Stories** with `parent` set to the Epic (native Epic Link in team-managed projects — no custom field needed). Stories filed directly will be picked up by the Classifier in M2.
+   - For `awp-pm` only (M1): in the same admin page, **Credentials → Create credentials → API Token**, name it (e.g. `n8n-awp-pm`), and pick the following scopes:
+     - `read:jira-work` — search issues, list transitions, read comments
+     - `write:jira-work` — create issues, add comments, label, transition
+     - `read:jira-user` — resolve `currentUser()` in JQL
 
-4. **Board and statuses** — Jira's **Backlog** is an entity (a tab in the project sidebar), not a column. Issues with status `Backlog` live there and are *not* on the board. Everything else moves through five board columns:
+     Save the token immediately — Atlassian shows it once.
 
-   | Status | Where it appears | Set by |
+     **Critical caveat**: service-account API tokens are *scoped tokens* and **cannot authenticate against `<workspace>.atlassian.net`** — they return 401. They only work against the gateway `https://api.atlassian.com/ex/jira/<cloudId>/...` with `Authorization: Bearer <token>`. All Jira HTTP Request nodes in our workflows are wired to that endpoint. See <https://support.atlassian.com/atlassian-cloud/kb/401-unauthorized-error-when-service-account-accesses-jira-or-confluence-api/>.
+
+3. **Workspace `cloudId`** — one-time, public lookup (no auth needed):
+
+   ```bash
+   curl -s https://<workspace>.atlassian.net/_edge/tenant_info
+   # → {"cloudId": "<uuid>"}
+   ```
+
+   Paste the value into `awp-n8n/.env` as `JIRA_CLOUD_ID=<uuid>`. The workflow's `Set Jira workspace` Code node fails fast if this env var is missing or not a UUID. `cloudId` is stable per workspace.
+
+4. **Issue type hierarchy** — `Project settings → Issue types`. Confirm **Epic**, **Story**, **Bug**, and **Subtask** are all enabled (defaults in any team-managed Jira project). In M1 the PM workflow watches **Epics with `assignee = awp-pm`** and creates **Stories** with `parent.key` set to the Epic (native Epic-Link mechanism in team-managed projects — no custom field, no Epic Link customfield). Stories and Bugs filed directly are not picked up until Classifier ships in M2.
+
+5. **Board and statuses** — use the **default team-managed workflow** as-is. Jira ships these five statuses, all visible as columns on the Kanban board:
+
+   | Status | Column | Set by |
    |---|---|---|
-   | `Backlog` | Backlog tab only | Default for new Epics/Stories. PM trigger watches Epics here. |
-   | `To Do` | Board column 1 | PM after decomposing an Epic; Classifier (M2) for direct Stories. |
-   | `In Progress` | Board column 2 | Epic after decomposition; executing agent (Dev/QA/DevOps) once it picks up a Story. |
-   | `PR` | Board column 3 | Dev after opening a PR; QA / reviewer working. |
-   | `Ready to Merge` | Board column 4 | All checks/reviews green, awaiting human merge. |
-   | `Done` | Board column 5 | After merge. |
+   | `To Do` | 1 | Default for new issues (Epic / Story / Bug). PM trigger watches Epics here filtered by `assignee = awp-pm`. Stories created via REST also land here. |
+   | `In Progress` | 2 | PM transitions the Epic here after decomposition; executing agent (M2+) once it picks up a Story. |
+   | `PR` | 3 | Dev after opening a PR; QA / reviewer working. |
+   | `Ready to Merge` | 4 | All checks/reviews green, awaiting human merge. |
+   | `Done` | 5 | After merge. |
 
-   Add any missing status via `Project settings → Workflow`.
+   > **No `Backlog` status.** Jira's "Backlog" is a tab in the project sidebar (a view, not a status); the default team-managed workflow does not include a `Backlog` status and we don't need one. Epics live not on the board but in the **Backlog tab → Epics panel** on the right side — expand if collapsed, or filter by `Type = Epic` in JQL.
 
-5. **Label `needs-clarification`** — used by PM in its failure path instead of a dedicated status. When PM can't decompose an Epic, the Epic stays in `Backlog`, gets this label, and PM posts its questions as a comment. The PM trigger excludes Epics carrying this label, so the ticket sits quietly until you remove the label.
+6. **Label `Needs_Clarification`** — used by PM in its failure path instead of a dedicated status. When PM can't decompose an Epic, the Epic stays in `To Do` with `assignee = awp-pm`, gets this label, and PM posts its questions as a comment. The PM trigger excludes Epics carrying this label, so the ticket sits quietly until you remove the label.
 
-6. **Custom fields** — **internal IDs (`customfield_NNNNN`) are the only thing the Jira REST API knows about**. Display names are cosmetic — rename in `Project settings → Custom fields → ⋯ → Edit name` any time without breaking anything. Workflows reference fields by semantic key; the canonical mapping (semantic key → `customfield_NNNNN` + display name) lives in `awp-agents/agents/shared/jira-fields.yaml`. Proposed names:
+7. **Custom fields** — **internal IDs (`customfield_NNNNN`) are the only thing the Jira REST API knows about**. Display names are cosmetic — rename in `Project settings → Custom fields → ⋯ → Edit name` any time without breaking anything. Workflows reference fields by semantic key; the canonical mapping (semantic key → `customfield_NNNNN` + display name) lives in `awp-agents/agents/shared/jira-fields.yaml`. Proposed names:
 
    | Semantic key (code) | Display name (Jira UI) | Type | Filled by |
    |---|---|---|---|
@@ -181,21 +199,23 @@ API tokens and n8n credentials are added per-role as agents come online — M1 o
 
 ### Who picks up what (M1)
 
-The workflow trigger filters by **issue type**, so the user-visible contract is *what you create*:
+The workflow routes by **issue type + assignee**, so the user-visible contract is *what you file and how you assign it*:
 
-| You file in Backlog | Picked up by | Milestone | What happens |
-|---|---|---|---|
-| **Epic**, `AWP Role` empty, no `needs-clarification` label | PM agent | M1 | Decomposes into ≤ 10 linked Stories (status `To Do`, assignee + fields filled). Epic transitions `Backlog → In Progress`. |
-| **Story**, `AWP Role` empty | Classifier | M2 | Fast track: fills role / tier / estimates, no decomposition; moves to `To Do`. |
-| **Story**, `AWP Role` set | Executing agent | M2+ | Dev/QA/DevOps picks up by `assignee` and moves status through the board. |
+| You file (status `To Do`) | + assignee | + AWP Role | Picked up by | Milestone | What happens |
+|---|---|---|---|---|---|
+| **Epic** | `awp-pm` | n/a | PM agent | M1 | Decomposes into ≤ 10 Stories linked via `parent`, fills role / tier / acceptance criteria / estimates, sets `assignee` to the role's service account. Epic transitions `To Do → In Progress`. |
+| **Story** | unassigned | empty | Classifier | M2 | Fast track: fills role / tier / estimates, no decomposition. |
+| **Bug** (reporter ≠ `awp-qa`) | unassigned | empty | Classifier | M2 | Same fast track as Stories — applies to human-filed defects (production issues, user reports). |
+| **Bug** (reporter = `awp-qa`) | `awp-dev` (pre-filled) | filled (pre-filled) | (none — bypasses Classifier) | M3+ | The QA agent fills the AWP fields itself when reporting and assigns the Bug to `awp-dev`, so it lands as a normal Dev task. |
+| **Story** or **Bug** | `awp-dev / awp-qa / awp-devops` | filled | Executing agent | M2+ | Dev / QA / DevOps picks up by `assignee` and moves status through the board. |
 
 In M1 the PM trigger JQL is:
 
 ```
-project = AWP AND issuetype = Epic AND status = "Backlog" AND "AWP Role" IS EMPTY AND labels NOT IN ("needs-clarification")
+project = ATF AND type = Epic AND status = "To Do" AND assignee = currentUser() AND (labels IS EMPTY OR labels NOT IN (Needs_Clarification))
 ```
 
-Stories filed directly are *not* picked up until Classifier ships in M2.
+`currentUser()` resolves to whatever Jira account the n8n credential is for — i.e. `awp-pm`. So **to have PM pick up an Epic, just set its `assignee` to `awp-pm`**. Stories and Bugs filed directly are *not* picked up until Classifier ships in M2.
 
 ### Anthropic (one-time, in console.anthropic.com)
 
@@ -212,11 +232,13 @@ Stories filed directly are *not* picked up until Classifier ships in M2.
 `Credentials → Create New`:
 
 1. **`anthropic`** (type `Anthropic API`) — paste your Anthropic API key.
-2. **`jira:awp-pm`** (type `Jira Software Cloud API`):
-   - `Domain` = `<workspace>.atlassian.net`
-   - `Email` = the service-account email Atlassian shows on the API-token creation page (commonly `<accountId>@connect.atlassian.com`; copy exactly)
-   - `API Token` = the token from step 2 above
-3. Per-role Jira credentials (`jira:awp-dev`, `jira:awp-qa`, `jira:awp-devops`) are added as those roles come online in M2/M3.
+2. **`jira:awp-pm`** (type **`HTTP Header Auth`**, NOT `Jira Software Cloud API`):
+   - `Name` = `Authorization`
+   - `Value` = `Bearer <scoped-token>` (the scoped API token you minted for `awp-pm` in admin.atlassian.com — include the literal `Bearer ` prefix with a single space)
+
+   **Why HTTP Header Auth and not Jira Software Cloud API?** Atlassian service accounts can only generate **scoped** API tokens, and scoped tokens 401 against `<workspace>.atlassian.net`. The only working endpoint is `https://api.atlassian.com/ex/jira/<cloudId>/rest/api/...` with `Authorization: Bearer <token>`. n8n's built-in `Jira Software Cloud API` credential is hard-coded to do Basic auth against the workspace domain, so we bypass it entirely and use `HTTP Header Auth` instead. See [the Atlassian KB on this 401](https://support.atlassian.com/atlassian-cloud/kb/401-unauthorized-error-when-service-account-accesses-jira-or-confluence-api/).
+
+3. Per-role Jira credentials (`jira:awp-dev`, `jira:awp-qa`, `jira:awp-devops`) are added as those roles come online in M2/M3, each as a `HTTP Header Auth` credential with its own scoped token.
 
 (The n8n API key for the sidecar is a separate thing, covered in *Workflow sync* below.)
 
@@ -226,8 +248,8 @@ Stories filed directly are *not* picked up until Classifier ships in M2.
 
 | Role id | Authored in | First used by | Service account | Input it watches |
 |---|---|---|---|---|
-| `pm` | M1 | `01_pm_intake.json` | `awp-pm` | Epic in Backlog, `awp.role` empty |
-| `classifier` | M2 | `02_classifier.json` | shares `awp-pm` | Story in Backlog, `awp.role` empty |
+| `pm` | M1 | `01_pm_intake.json` | `awp-pm` | Epic, `status = "To Do"`, `assignee = awp-pm`, no `Needs_Clarification` label |
+| `classifier` | M2 | `02_classifier.json` | shares `awp-pm` | Story or Bug, `awp.role` empty, `reporter != awp-qa` for Bugs |
 | `dev` | M2 | `03_dev_loop.json` | `awp-dev` | Story `assignee = awp-dev` |
 | `qa` | M3 | `03_dev_loop.json` (handoff) | `awp-qa` | Story `assignee = awp-qa` |
 | `devops` | M3 | `04_review_debug.json` | `awp-devops` | Story `assignee = awp-devops`; red CI |
@@ -250,6 +272,73 @@ Why REST and not CLI: `n8n import:workflow` (a) imports workflows **without an o
 
 Without `N8N_API_KEY` the sidecar exits cleanly with a help message and does nothing — set the key first (see [M0 quick start](#m0-quick-start)).
 
+### Editor session traps (read this when n8n "lies" to you)
+
+n8n's editor keeps node outputs in **browser session state**, decoupled from the server-side workflow. Consequences that have bitten this project hard:
+
+- **Stale outputs survive workflow edits.** After re-syncing the workflow JSON via the sidecar or editing nodes in the UI, the OUTPUT pane may still show the previous execution's result — even though the server-side workflow definition is brand-new. Token "Last used" timestamps on the upstream API stay frozen because no real request is fired.
+- **Pinned data is *not* always visible via the public API.** A node can have an editor-only pinned output that doesn't appear in `GET /api/v1/workflows/{id}` (`pinData` returns `{}`). The pin lives only in your browser session.
+- **`Execute step` uses the cached upstream outputs**, not a fresh execution from the Schedule Trigger. `Execute workflow` runs from the start but still respects pinned data.
+
+When n8n's behaviour stops matching reality (works in shell, fails in n8n; same auth header but different responses; outputs that don't update after edits), the diagnostic is always the same:
+
+```
+Cmd+Shift+R   (hard browser refresh)
+```
+
+This drops the editor session, re-fetches the saved workflow from the server, and clears any stuck cached outputs. After the refresh, click `Set Jira workspace` → `Execute step` first to populate upstream outputs, then `Execute step` on downstream nodes.
+
+Avoid manually pinning data unless you're explicitly testing — every pin is a future debugging session waiting to happen.
+
+### Credential resolution (name → id) at sync time
+
+n8n's node-credentials blocks look like this in JSON:
+
+```json
+"credentials": {
+  "httpHeaderAuth": {
+    "id": "DBt1WVqzfoKY4adQ",
+    "name": "jira:awp-pm"
+  }
+}
+```
+
+n8n indexes credentials by **id** internally; the `name` field is informational. If a workflow is imported with only `name` and no `id`, n8n raises `Found credential with no ID` at execution time. (Some built-in credential types — `jiraSoftwareCloudApi`, `anthropicApi` — auto-resolve by name as a legacy compatibility; generic types like `httpHeaderAuth` do not.)
+
+To keep workflow JSONs in this repo human-readable (no UUID gore committed alongside the rest), the sidecar fetches `GET /api/v1/credentials` at startup, builds a `(type, name) → id` map, and walks every workflow node's `credentials` block to inject the `id` before pushing. Each workflow log line includes `resolved N credential reference(s) to IDs`.
+
+If a workflow references a credential by name that doesn't exist in n8n yet, the sidecar logs a `WARNING` line listing the missing `(node, type, name)` and skips that single reference; the workflow imports successfully but will 4xx at execution time until you create the credential in the UI.
+
+This means: **adding a new credential is always a UI step first** (Settings → Credentials → New) — there is no provisioning side of the sidecar. The workflow JSON refers to the credential by `name` (e.g. `jira:awp-pm`) and the sidecar fills in the `id` on every sync.
+
+### `{{INCLUDE:relative/path}}` markers (workflow templating)
+
+Before pushing each workflow JSON to n8n, the sidecar walks every string field and replaces `{{INCLUDE:relative/path/to/file}}` markers with a **JS string literal** (i.e. JSON-stringified contents) of that file. Paths are resolved relative to `INCLUDE_BASE_DIR` (`/home/node/awp-agents` in the dev overlay) and may not escape it.
+
+Typical use: bake a long static text artifact — e.g. an agent's `system.xml` prompt — into a Code node at sync time, so the workflow JS sees a normal string constant. The source pattern in the workflow JSON looks like:
+
+```js
+const systemPrompt = {{INCLUDE:agents/pm/prompts/system.xml}};
+```
+
+…which the sidecar turns into:
+
+```js
+const systemPrompt = "<system_prompt name=\"awp-pm\">\n\n<role>\nYou are AWP's…";
+```
+
+Why this exists: n8n 2.21+ runs Code nodes in a separate Task Runner with `binaryDataMode=filesystem` — cross-node binary access (`$('Read File').first().binary.X.data`) returns lazy references without the actual bytes, so reading a file via the `Read/Write Files from Disk` node and consuming it in a downstream Code node *does not work*. Baking text artifacts in at sync time sidesteps the whole class of binary-data-propagation bugs.
+
+Iteration loop for editing a baked-in file:
+
+```bash
+$EDITOR ../awp-agents/agents/pm/prompts/system.xml
+docker compose run --rm n8n-import
+# n8n now has the updated jsCode; open the workflow and Execute step
+```
+
+The local workflow JSON keeps the marker (it's the source of truth); only n8n's internal copy ever contains the expanded form. Don't round-trip workflow JSONs back to disk via the n8n UI's *Download* button after they've been synced — that would write the expanded prompt over the marker, breaking iteration.
+
 ### Adding a new workflow
 
 1. Author / export the JSON.
@@ -263,7 +352,8 @@ Without `N8N_API_KEY` the sidecar exits cleanly with a help message and does not
 
 1. Edit in the n8n editor at <http://localhost:5678>.
 2. `…` menu → `Download` → save over the matching `NN_*.json`. Keep the `name` field stable (it's the sync key).
-3. `git commit`. The next `docker compose up` re-syncs.
+3. **If the workflow contained `{{INCLUDE:…}}` markers**, restore them by hand before committing — the downloaded JSON contains the expanded form (the marker was lost during sync). Diff against the previous version to spot the inlined block.
+4. `git commit`. The next `docker compose up` re-syncs.
 
 ### Triggering sync manually
 
@@ -314,9 +404,12 @@ Then change the volume mount and build context in `docker-compose.dev.yml` from 
 ## Roadmap
 
 - **M0 — Skeleton.** Done. Smoke test passes.
-- **M1 — Jira intake + PM (Layer-1 only, no MCP added).** PM polls Epics in Backlog via `Jira Trigger` (as `awp-pm`), decomposes each Epic into ≤ 10 Stories via the native Jira node, fills the AWP custom fields (`AWP Role`, `AWP Tier`, `AWP Acceptance Criteria`, `AWP Estimated Input Tokens`, `AWP Estimated Output Tokens`) and sets `assignee` on each Story to the role's service-account `accountId`. Stories land with status `To Do` (board column 1); the Epic transitions `Backlog → In Progress`. Vague Epics get the `needs-clarification` label instead of a status change. `anthropic` + `jira:awp-pm` credentials added in n8n. Field-name mapping kept in `awp-agents/agents/shared/jira-fields.yaml`.
-- **M2 — Dev happy path + Classifier + first L2 MCP.** Classifier picks up unlabeled Stories (`issuetype = Story AND "AWP Role" IS EMPTY`) via native Jira node only, fills role/tier/estimates. Dev agent (as `awp-dev`) gets the first MCP handlers (`runtime` shell sandbox + `fs` filesystem) consolidated in the single `awp-mcp` Go binary. Native GitHub node opens branch + PR + posts CI status back to Jira. Every agent writes actual tokens + computes `actual_cost_usd` from `agents/shared/pricing.yaml`.
-- **M3 — Review + Debug loops.** Reviewer + DevOps workflows, iteration limits (`debug=2`, `review=3` defaults), Telegram alerts on escalation (native Telegram node).
+- **M1 — Jira intake + PM (Layer-1 only, no MCP added).** PM polls Epics with `assignee = awp-pm` and `status = "To Do"` (via a Schedule trigger + Jira search node, both running on the `jira:awp-pm` credential), decomposes each Epic into ≤ 10 Stories via an HTTP Request node calling `POST /rest/api/2/issue` (the native Jira node silently ignores `parentIssueKey` for non-subtask issuetypes, so we go direct), fills the AWP custom fields (`AWP Role`, `AWP Tier`, `AWP Acceptance Criteria`, `AWP Estimated Input Tokens`, `AWP Estimated Output Tokens`) and sets `assignee` on each Story to the role's service-account `accountId`. Stories land with `status = "To Do"` (Jira default for new issues); the Epic transitions `To Do → In Progress`. Vague Epics get the `Needs_Clarification` label and a comment with PM's questions, no status change. `anthropic` + `jira:awp-pm` credentials added in n8n. Field-name mapping kept in `awp-agents/agents/shared/jira-fields.yaml` (the workflow's `Parse PM output` Code node hardcodes a copy, kept in sync manually).
+- **M2 — Dev happy path + Classifier + first L2 MCP.** Classifier picks up unlabeled Stories and human-filed Bugs (`type IN (Story, Bug) AND "AWP Role" IS EMPTY AND reporter != awp-qa`) via native Jira node only, fills role/tier/estimates. Bugs reported by `awp-qa` are excluded because the QA agent fills the AWP fields itself when reporting. Dev agent (as `awp-dev`) gets the first MCP handlers (`runtime` shell sandbox + `fs` filesystem) consolidated in the single `awp-mcp` Go binary. Native GitHub node opens branch + PR + posts CI status back to Jira. Every agent writes actual tokens + computes `actual_cost_usd` from `agents/shared/pricing.yaml`.
+- **M3 — Review + Debug loops.** Reviewer + DevOps workflows, iteration limits (`debug=2`, `review=3` defaults), Telegram alerts on escalation (native Telegram node, one-way push only — no public endpoint needed yet).
+- **M3.5 — Bidirectional PM (Jira comment webhook).** Replaces the M1 "edit Epic description → wait for poll" clarification UX with "answer in a Jira comment → PM reacts within seconds via webhook". First milestone that needs a public n8n endpoint (Cloudflare Tunnel by default; see `PLAN.md` §15). Polling in `01_pm_intake.json` stays as a fallback. Unblocks Telegram bot conversations (M7) by reusing the same endpoint.
 - **M4 — Dispatcher.** `dispatch_loop` workflow + per-role caps from `.env`, atomic Jira status transitions. No broker.
 - **M5 — Chat Trigger + project bootstrap.** Conversational entry point + repo template.
-- **M6 — Calibration + budget.** `calibrate_estimates` cron → `agents/shared/estimates.md`. Hard stop on monthly `sum(actual_cost_usd)` + Telegram alert.
+- **M6 — Calibration + budget. _MVP closes here._** `calibrate_estimates` cron → `agents/shared/estimates.md`. Hard stop on monthly `sum(actual_cost_usd)` + Telegram alert.
+- **M7 — Telegram bot interactive UX (post-MVP).** Main menu (tasks needing attention, per-role chat), per-task threads where Telegram replies become Jira comments (re-entering via M3.5), push notifications with action buttons (`KEY-324 PR is Ready for human review · [Go to PR]`). See `PLAN.md` §16.
+- **M8 — MCP-equipped chatbot for project queries (post-MVP).** Bot grows an AI Agent node with Jira MCP + GitHub MCP clients so the user can ask ad-hoc questions ("how many active tasks?", "at what stage is the project?", "how much did we spend this month?"). See `PLAN.md` §10 (M8) + §16.

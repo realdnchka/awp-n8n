@@ -1,0 +1,557 @@
+{
+  "id": "00000000-0000-0000-0000-000000000020",
+  "name": "01 — PM intake (Epic → Stories)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "seconds", "secondsInterval": 60 }
+          ]
+        }
+      },
+      "id": "22222222-2222-2222-2222-222222220001",
+      "name": "Every minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Single source of truth for Atlassian endpoints used by this workflow.\n// Reads two env vars off the n8n container:\n//\n//   JIRA_DOMAIN   — host portion only, e.g. '0xdc.atlassian.net'. Used for\n//                   human-facing browse URLs in comments etc.\n//   JIRA_CLOUD_ID — UUID returned by https://<JIRA_DOMAIN>/_edge/tenant_info.\n//                   Stable per workspace.\n//\n// boardId is intentionally NOT taken from env. Boards are per-project, and\n// hardcoding a single boardId would force a 1:1 n8n-instance-to-project\n// binding. Instead the workflow resolves it at runtime from each Epic's\n// project key (see 'Jira — list boards for project' + 'Pick board for project'\n// later in the pipeline). The first kanban board returned for a given\n// projectKey is used; if you need per-project board pinning, extend that\n// node to also consult a workflow-static-data cache (TODO comment lives there).\n//\n// All REST calls go through `apiBase` = https://api.atlassian.com/ex/jira/<id>,\n// NOT through https://<JIRA_DOMAIN>. This is required because Atlassian service\n// accounts can only mint scoped API tokens, and scoped tokens 401 on the\n// workspace domain — they only authenticate against the api.atlassian.com\n// gateway. See:\n//   https://support.atlassian.com/atlassian-cloud/kb/401-unauthorized-error-when-service-account-accesses-jira-or-confluence-api/\n//\n// n8n 2.21+ runs Code nodes in an isolated Task Runner where `process` is not\n// in scope; env vars come in via the `$env` global. The container must also\n// have N8N_BLOCK_ENV_ACCESS_IN_NODE=false (set in docker-compose.yml) for\n// $env to surface anything.\n\nconst host = typeof $env.JIRA_DOMAIN === 'string' ? $env.JIRA_DOMAIN.trim() : '';\nif (!host) {\n  throw new Error('JIRA_DOMAIN env var is not set on the n8n container, or N8N_BLOCK_ENV_ACCESS_IN_NODE is still true. Check awp-n8n/.env and docker-compose.yml, then restart the container.');\n}\nif (host.startsWith('http://') || host.startsWith('https://')) {\n  throw new Error('JIRA_DOMAIN should be the host only (e.g. mycompany.atlassian.net), without scheme. Got: ' + host);\n}\n\nconst cloudId = typeof $env.JIRA_CLOUD_ID === 'string' ? $env.JIRA_CLOUD_ID.trim() : '';\nif (!cloudId) {\n  throw new Error('JIRA_CLOUD_ID env var is not set on the n8n container. Get it via:  curl -s https://' + host + '/_edge/tenant_info  and put the cloudId field into awp-n8n/.env.');\n}\nif (!/^[0-9a-f-]{36}$/i.test(cloudId)) {\n  throw new Error('JIRA_CLOUD_ID does not look like a UUID. Got: ' + cloudId);\n}\n\nreturn [{\n  json: {\n    workspace: host,\n    domain: 'https://' + host,\n    cloudId,\n    apiBase: 'https://api.atlassian.com/ex/jira/' + cloudId,\n  },\n}];\n"
+      },
+      "id": "22222222-2222-2222-2222-222222220002",
+      "name": "Set Jira workspace",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [380, 320]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/2/search/jql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  jql: 'type = Epic AND status = \"To Do\" AND assignee = currentUser() AND (labels IS EMPTY OR labels NOT IN (Needs_Clarification))',\n  fields: ['summary', 'description', 'labels', 'assignee', 'status', 'parent', 'project', 'creator', 'reporter'],\n  expand: 'changelog',\n  maxResults: 50\n}) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222221002",
+      "name": "Jira — search PM-assigned Epics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 320],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split the Atlassian POST /rest/api/3/search/jql response into one item\n// per Epic. Input shape: a single item whose json.issues is the array of\n// Epics. Workspace domain comes via cross-node ref to `Set Jira workspace`.\n//\n// The PM system prompt is baked into this node at sync time by the awp-sync\n// sidecar: the INCLUDE marker below (matches /\\{\\{INCLUDE:[^}]+\\}\\}/) is\n// replaced with a JS string literal containing the prompt file's contents.\n// We don't use n8n's Read File node because n8n 2.21+ runs Code nodes in a\n// Task Runner where cross-node binary access (binaryDataMode=filesystem)\n// hands you a lazy reference without the actual bytes — useless inside the\n// sandbox. The bake-at-sync-time pattern keeps system.xml as the source\n// of truth: edit the file, re-run `docker compose run --rm n8n-import`,\n// and the new prompt is live.\n//\n// Output: N items, one per Epic, each carrying everything downstream\n// nodes need:\n//   - epic: the Epic JSON the PM Agent reasons on\n//   - domain: 'https://<workspace>.atlassian.net' (for HTTP Request URLs)\n//   - systemPrompt: utf-8 of the PM prompt file (inlined at sync time)\n//   - userMessage: pre-built JSON the langchain Agent feeds to Sonnet\n\nconst systemPrompt = {{INCLUDE:agents/pm/prompts/system.xml}};\n\nconst item = $input.first();\nconst response = (item && item.json) || {};\nconst issues = Array.isArray(response.issues) ? response.issues : [];\n\nconst wsItem = $('Set Jira workspace').first();\nconst domain = wsItem && wsItem.json && wsItem.json.domain;\nconst apiBase = wsItem && wsItem.json && wsItem.json.apiBase;\nif (!domain || !apiBase) {\n  throw new Error('Could not read domain/apiBase from Set Jira workspace node.');\n}\n\n// Atlassian's REST v2 returns description as a plain string (wiki markup or\n// plain text). REST v3 returns it as an ADF (Atlassian Document Format)\n// tree — an object we'd otherwise stringify to '[object Object]' or lose.\n// This helper walks an ADF tree and concatenates every `text` leaf, which\n// is good enough to feed PM (we don't need formatting fidelity here).\nfunction adfToText(node) {\n  if (node == null) return '';\n  if (typeof node === 'string') return node;\n  if (Array.isArray(node)) return node.map(adfToText).join('');\n  if (typeof node === 'object') {\n    let out = '';\n    if (typeof node.text === 'string') out += node.text;\n    if (Array.isArray(node.content)) out += adfToText(node.content);\n    if (node.type === 'paragraph' || node.type === 'heading' || node.type === 'bulletList' || node.type === 'orderedList' || node.type === 'listItem') {\n      out += '\\n';\n    }\n    return out;\n  }\n  return '';\n}\n\n// Resolve the human \"author\" we credit (and @mention) in the PM-rewrite audit\n// comment. Logic: scan the Epic's changelog (which we asked for via the\n// search's `expand=changelog` parameter) for the most recent `description`\n// edit AUTHORED BY A HUMAN; the author of that edit is who PM is paraphrasing.\n// We skip changelog entries authored by any AWP service account, otherwise\n// PM ends up self-mentioning on every re-run: PM's own description PUT is\n// always the most recent description edit. If no human description edit\n// exists yet (common case for a fresh Epic), fall back to `fields.creator`.\n// If even creator is missing or is itself a service account, return null and\n// the audit-comment node will degrade to the generic \"by the human\" wording.\n//\n// IMPORTANT: keep AWP_SERVICE_ACCOUNT_IDS in sync with\n// awp-agents/agents/shared/jira-accounts.yaml. When we add new roles, their\n// accountIds belong here too — otherwise we'll erroneously @-mention the new\n// AI agent in audit comments.\nconst AWP_SERVICE_ACCOUNT_IDS = new Set([\n  '712020:5a2a8ccc-e479-49a1-9965-2748d01d9d26', // awp-pm\n  '712020:88195866-6d79-4da8-a642-e559cd055709', // awp-dev\n  '712020:3643c5de-b750-4046-908d-0bc55051ad03', // awp-qa\n  '712020:4e757014-d33f-4d1e-acf4-1c0eb3c2848f', // awp-devops\n]);\n\nfunction isHumanAccountId(accountId) {\n  return !!accountId && !AWP_SERVICE_ACCOUNT_IDS.has(accountId);\n}\n\nfunction resolveAuthor(epic) {\n  const histories = (epic.changelog && Array.isArray(epic.changelog.histories)) ? epic.changelog.histories : [];\n  // histories arrive oldest-first; walk in reverse to find the LAST description edit by a human.\n  for (let i = histories.length - 1; i >= 0; i--) {\n    const h = histories[i];\n    const items = Array.isArray(h.items) ? h.items : [];\n    if (!items.some(it => it.field === 'description' || it.fieldId === 'description')) continue;\n    const a = h.author || {};\n    if (isHumanAccountId(a.accountId)) {\n      return { accountId: a.accountId, displayName: a.displayName || '' };\n    }\n  }\n  // No human description edit found — fall back to the original creator,\n  // but only if they are themselves human (avoids self-tagging when an AI\n  // role files the Epic, e.g. future architect-PM creating sub-Epics).\n  const c = epic.fields && epic.fields.creator;\n  if (c && isHumanAccountId(c.accountId)) return { accountId: c.accountId, displayName: c.displayName || '' };\n  return null;\n}\n\nconst out = [];\nfor (const epic of issues) {\n  const rawDesc = epic.fields?.description;\n  let description = '';\n  if (typeof rawDesc === 'string') {\n    description = rawDesc;\n  } else if (rawDesc && typeof rawDesc === 'object') {\n    description = adfToText(rawDesc).trim();\n  }\n\n  const projectKey = epic.fields?.project?.key || (epic.key || '').split('-')[0] || '';\n  const author = resolveAuthor(epic);\n  out.push({\n    json: {\n      epic: {\n        key: epic.key,\n        id: epic.id,\n        summary: epic.fields?.summary || '',\n        description,\n        projectKey,\n        author,\n      },\n      domain,\n      apiBase,\n      systemPrompt,\n      userMessage: JSON.stringify({\n        epic: {\n          key: epic.key,\n          summary: epic.fields?.summary || '',\n          description,\n        },\n      }),\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "22222222-2222-2222-2222-222222220004",
+      "name": "Prep Epic + prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 320]
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "claude-haiku-4-5",
+          "cachedResultName": "claude-haiku-4-5"
+        },
+        "options": {
+          "maxTokensToSample": 16384,
+          "temperature": 0.2
+        }
+      },
+      "id": "22222222-2222-2222-2222-222222220005",
+      "name": "Anthropic Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [1180, 500],
+      "credentials": {
+        "anthropicApi": {
+          "name": "anthropic"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelName": {
+          "__rl": true,
+          "mode": "id",
+          "value": "models/gemini-3.5-flash"
+        },
+        "options": {
+          "maxOutputTokens": 16384,
+          "temperature": 0.2
+        }
+      },
+      "id": "22222222-2222-2222-2222-2222222200f0",
+      "name": "Google Gemini Chat Model (test, unwired)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [1180, 700],
+      "notesInFlow": true,
+      "notes": "Alternative free model for cheap/throwaway testing of PM behaviour.\n\nTo switch from Sonnet/Haiku to Gemini 3.5 Flash:\n  1. Click the line connecting `Anthropic Chat Model` → `PM Agent` (ai_languageModel input) and delete it.\n  2. Drag from this node's output dot onto the same `PM Agent` ai_languageModel input.\n  3. Execute the workflow.\n\nCredential `google-gemini` (type 'Google Gemini(PaLM) API') must be created in n8n once:\n  - Get an API key from https://aistudio.google.com/apikey\n  - Free tier: ~1500 req/day, 1M-token context, 65k-token output — plenty for PM.\n\nThis node stays disconnected by default so the prod path keeps using Anthropic.",
+      "credentials": {
+        "googlePalmApi": {
+          "name": "google-gemini"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.userMessage }}",
+        "options": {
+          "systemMessage": "={{ $json.systemPrompt }}"
+        }
+      },
+      "id": "22222222-2222-2222-2222-222222220006",
+      "name": "PM Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [1180, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse PM's <output>...</output> block and split into two execution paths:\n//   - stories     : N items, one per Story to be created\n//   - clarification: 1 item carrying the questions list\n//\n// Hardcoded maps below MUST stay in sync with:\n//   awp-agents/agents/shared/jira-accounts.yaml  (accountId per role)\n//   awp-agents/agents/shared/jira-fields.yaml    (customfield_NNNNN per semantic key)\n// When you change either yaml, update this Code node too.\n//\n// `description` is converted from Markdown to ADF (Atlassian Document Format)\n// because we POST Stories via /rest/api/3/issue. Jira's v2 endpoint took\n// description as a plain string interpreted as wiki markup, which mangled\n// PM's Markdown (`## Heading` rendered as a literal numbered list, bullet\n// points nested inside the heading, etc.). v3 takes ADF, an explicit JSON\n// tree of structural nodes — no parsing ambiguity. The converter below is\n// deliberately small: it handles paragraphs, headings (h1-h6), and bullet\n// lists, which cover everything PM emits per the system prompt. Anything\n// fancier (tables, inline bold/italic) we don't ask PM for; if we ever do,\n// extend the converter, don't try to push Markdown straight through.\nfunction mdToAdf(md) {\n  const text = typeof md === 'string' ? md : '';\n  const lines = text.split('\\n');\n  const content = [];\n  let listBuf = null;\n  let paraBuf = [];\n\n  const flushPara = () => {\n    if (paraBuf.length) {\n      content.push({\n        type: 'paragraph',\n        content: [{ type: 'text', text: paraBuf.join(' ') }],\n      });\n      paraBuf = [];\n    }\n  };\n  const flushList = () => {\n    if (listBuf) { content.push(listBuf); listBuf = null; }\n  };\n\n  for (const raw of lines) {\n    const trimmed = raw.replace(/^\\s+|\\s+$/g, '');\n    const h = trimmed.match(/^(#{1,6})\\s+(.+)$/);\n    if (h) {\n      flushPara(); flushList();\n      content.push({\n        type: 'heading',\n        attrs: { level: h[1].length },\n        content: [{ type: 'text', text: h[2] }],\n      });\n      continue;\n    }\n    const b = trimmed.match(/^[-*]\\s+(.+)$/);\n    if (b) {\n      flushPara();\n      if (!listBuf) listBuf = { type: 'bulletList', content: [] };\n      listBuf.content.push({\n        type: 'listItem',\n        content: [{\n          type: 'paragraph',\n          content: [{ type: 'text', text: b[1] }],\n        }],\n      });\n      continue;\n    }\n    if (trimmed === '') {\n      flushPara(); flushList();\n      continue;\n    }\n    flushList();\n    paraBuf.push(trimmed);\n  }\n  flushPara(); flushList();\n  if (content.length === 0) content.push({ type: 'paragraph' });\n  return { type: 'doc', version: 1, content };\n}\n\nconst ACCOUNT_IDS = {\n  dev:    '712020:88195866-6d79-4da8-a642-e559cd055709',\n  qa:     '712020:3643c5de-b750-4046-908d-0bc55051ad03',\n  devops: '712020:4e757014-d33f-4d1e-acf4-1c0eb3c2848f',\n};\nconst PM_ACCOUNT_ID = '712020:5a2a8ccc-e479-49a1-9965-2748d01d9d26';\n\nconst FIELDS = {\n  role:                   'customfield_10040',\n  tier:                   'customfield_10041',\n  acceptance_criteria:    'customfield_10042',\n  estimate_input_tokens:  'customfield_10043',\n  estimate_output_tokens: 'customfield_10044',\n};\n\nconst ROLE_OPTIONS = ['dev', 'qa', 'devops'];\nconst TIER_OPTIONS = ['L1', 'L2', 'L3'];\nconst MAX_STORIES = 10;\n\n// 1:1 mapping is preserved by the langchain Agent node, so we match by index.\nconst items = $input.all();\nconst epics = $('Prep Epic + prompt').all();\nconst out = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const epic = epics[i]?.json?.epic\n            || epics[0]?.json?.epic\n            || { key: 'UNKNOWN', summary: '', description: '' };\n\n  // The langchain Agent node returns its final answer under `output`.\n  const raw =\n    item.json.output\n    ?? item.json.text\n    ?? item.json.response\n    ?? '';\n\n  // Preferred shape per prompt: <output>{...json...}</output>. We accept three\n  // fallbacks because instruction-following on Haiku is uneven:\n  //   1) <output>...</output> wrapper (strict, ideal).\n  //   2) Raw JSON (no wrapper) — strip optional markdown fences first.\n  //   3) Markdown ```json ... ``` block anywhere in the response.\n  // Anything that doesn't yield a JSON object falls through to clarification\n  // with a diagnostic that quotes the raw response.\n  const rawStr = String(raw);\n  const taggedMatch = rawStr.match(/<output>([\\s\\S]*?)<\\/output>/i);\n  let inner = null;\n  if (taggedMatch) {\n    inner = taggedMatch[1].trim();\n  } else {\n    const fenceMatch = rawStr.match(/```(?:json)?\\s*([\\s\\S]*?)```/i);\n    if (fenceMatch) {\n      inner = fenceMatch[1].trim();\n    } else {\n      const first = rawStr.indexOf('{');\n      const last = rawStr.lastIndexOf('}');\n      if (first !== -1 && last > first) {\n        inner = rawStr.slice(first, last + 1).trim();\n      }\n    }\n  }\n\n  if (!inner) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: [\n          \"PM did not produce a parseable JSON object. Raw response: \" + rawStr.slice(0, 400),\n        ],\n      },\n    });\n    continue;\n  }\n\n  inner = inner.replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/i, '').trim();\n\n  let parsed;\n  try {\n    parsed = JSON.parse(inner);\n  } catch (e) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: [\n          \"PM emitted invalid JSON inside <output>: \" + e.message + \". Body: \" + inner.slice(0, 400),\n        ],\n      },\n    });\n    continue;\n  }\n\n  if (parsed.needs_clarification === true) {\n    const questions = Array.isArray(parsed.questions) ? parsed.questions.filter(q => typeof q === 'string' && q.trim()) : [];\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: questions.length ? questions : ['PM flagged needs_clarification but produced no questions.'],\n      },\n    });\n    continue;\n  }\n\n  if (!Array.isArray(parsed.stories)) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: ['PM output had neither a `stories` array nor `needs_clarification: true`.'],\n      },\n    });\n    continue;\n  }\n\n  if (parsed.stories.length === 0) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: ['PM returned zero Stories. Either the Epic is empty or PM could not decompose it.'],\n      },\n    });\n    continue;\n  }\n\n  if (parsed.stories.length > MAX_STORIES) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: [\n          `PM returned ${parsed.stories.length} Stories, cap is ${MAX_STORIES}. Please descope the Epic so it can be decomposed into 10 or fewer Stories.`,\n        ],\n      },\n    });\n    continue;\n  }\n\n  // PM should also emit a rewritten Epic description (markdown). It replaces\n  // the human author's original text in the Epic; the n8n workflow preserves\n  // the original in an audit comment (see `Jira — audit comment on Epic`).\n  // If PM omits it (older prompt versions, or model misbehaviour), we skip the\n  // description PUT but still create Stories and update token totals — better\n  // partial success than failing the whole decomposition.\n  const epicDescriptionMd = typeof parsed.epic_description === 'string' ? parsed.epic_description.trim() : '';\n  const epicDescriptionAdf = epicDescriptionMd ? mdToAdf(epicDescriptionMd) : null;\n\n  // Validate every story up-front; one bad apple → kick the whole Epic to clarification.\n  const issues = [];\n  for (const [idx, s] of parsed.stories.entries()) {\n    if (typeof s.summary !== 'string' || !s.summary.trim()) issues.push(`story[${idx}].summary missing`);\n    if (typeof s.description !== 'string') issues.push(`story[${idx}].description missing`);\n    if (typeof s.acceptance_criteria !== 'string' || !s.acceptance_criteria.trim()) issues.push(`story[${idx}].acceptance_criteria missing`);\n    if (!ROLE_OPTIONS.includes(s.role)) issues.push(`story[${idx}].role must be one of ${ROLE_OPTIONS.join('|')}, got ${JSON.stringify(s.role)}`);\n    if (!TIER_OPTIONS.includes(s.tier)) issues.push(`story[${idx}].tier must be one of ${TIER_OPTIONS.join('|')}, got ${JSON.stringify(s.tier)}`);\n    if (typeof s.estimate_input_tokens !== 'number' || s.estimate_input_tokens <= 0) issues.push(`story[${idx}].estimate_input_tokens must be a positive number`);\n    if (typeof s.estimate_output_tokens !== 'number' || s.estimate_output_tokens <= 0) issues.push(`story[${idx}].estimate_output_tokens must be a positive number`);\n  }\n  if (issues.length) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: [\n          'PM output failed schema validation. PM must re-emit. Issues: ' + issues.join('; '),\n        ],\n      },\n    });\n    continue;\n  }\n\n  // Emit one item per Story with a pre-built Jira REST payload. The downstream\n  // HTTP node only needs to POST $json.restBody — no expression gymnastics there.\n  // We tag every story with its local id so the user can rebuild depends_on\n  // links manually later (M2 will add Jira issuelink wiring).\n  const domain = epics[i]?.json?.domain || epics[0]?.json?.domain;\n  const apiBase = epics[i]?.json?.apiBase || epics[0]?.json?.apiBase;\n  const projectKey = epic.projectKey || (epic.key || '').split('-')[0] || '';\n  if (!projectKey) {\n    out.push({\n      json: {\n        kind: 'clarification',\n        epic,\n        questions: ['Could not derive projectKey from Epic. Search node must request the project field; Epic should expose epic.fields.project.key.'],\n      },\n    });\n    continue;\n  }\n  for (const [idx, s] of parsed.stories.entries()) {\n    const role = s.role;\n    const tier = s.tier;\n    const story = {\n      localId: s.id || `s${idx + 1}`,\n      summary: s.summary.trim(),\n      description: s.description,\n      acceptance_criteria: s.acceptance_criteria,\n      role,\n      tier,\n      estimate_input_tokens: Math.round(s.estimate_input_tokens),\n      estimate_output_tokens: Math.round(s.estimate_output_tokens),\n      depends_on: Array.isArray(s.depends_on) ? s.depends_on : [],\n      assigneeAccountId: ACCOUNT_IDS[role],\n    };\n\n    // Jira REST v3 create-issue payload.\n    //   - Custom select-list fields: { value: \"option name\" }.\n    //   - Number fields: raw integers.\n    //   - Top-level `description`: ADF JSON tree (see mdToAdf at the top of\n    //     this node).\n    //   - `acceptance_criteria` (customfield, type text_multiline): ALSO\n    //     ADF in v3. The 'text_multiline' admin label is misleading — Jira\n    //     stores it as a Paragraph field whose REST v3 wire format is ADF.\n    //     We confirmed empirically: sending a plain string returns\n    //     `400 The field value is not valid Atlassian Document Format (ADF)\n    //     content.` So we pass it through the same converter as description.\n    //   - `parent.key`: links Story to its Epic in team-managed projects.\n    //   - `project.key`: whatever project the parent Epic lives in. Workflow\n    //     is multi-project aware: PM picks up Epics by `assignee = currentUser()`\n    //     across all projects PM is added to, and the resulting Stories land\n    //     in the same project as their parent Epic.\n    const restBody = {\n      fields: {\n        project: { key: projectKey },\n        issuetype: { name: 'Story' },\n        summary: story.summary,\n        description: mdToAdf(story.description),\n        assignee: { accountId: story.assigneeAccountId },\n        parent: { key: epic.key },\n        [FIELDS.role]: { value: role },\n        [FIELDS.tier]: { value: tier },\n        [FIELDS.acceptance_criteria]: mdToAdf(story.acceptance_criteria),\n        [FIELDS.estimate_input_tokens]: story.estimate_input_tokens,\n        [FIELDS.estimate_output_tokens]: story.estimate_output_tokens,\n      },\n    };\n\n    out.push({\n      json: {\n        kind: 'story',\n        epic,\n        epicDescriptionMd,\n        epicDescriptionAdf,\n        story,\n        fieldIds: FIELDS,\n        domain,\n        apiBase,\n        projectKey,\n        restBody,\n      },\n    });\n  }\n}\n\nreturn out;\n"
+      },
+      "id": "22222222-2222-2222-2222-222222220007",
+      "name": "Parse PM output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "id": "cond-needs-clarification",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "clarification",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220008",
+      "name": "Needs clarification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1660, 320]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issue/{{ $json.epic.key }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ update: { labels: [{ add: 'Needs_Clarification' }] } }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220009",
+      "name": "Jira — label Epic Needs_Clarification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1900, 180],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/2/issue/{{ $('Parse PM output').item.json.epic.key }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: 'PM could not decompose this Epic.\\n\\nQuestions:\\n' + (($('Parse PM output').item.json.questions) || []).map(function (q, i) { return (i + 1) + '. ' + q; }).join('\\n') + '\\n\\nRemove the `Needs_Clarification` label after editing the Epic to re-arm PM.' }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220010",
+      "name": "Jira — comment with questions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2140, 180],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.restBody) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220012",
+      "name": "Jira — create Story (REST)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1900, 460],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Translate PM's `depends_on` declarations into Jira \"Blocks\" issue-link\n// specs, one item per link. Runs in parallel with `One item per Epic` (both\n// are fed by `Jira — create Story (REST)`'s N-item output) because they read\n// the same upstream cross-node refs but produce orthogonal outputs:\n//   - `One item per Epic` collapses to 1 item per Epic for the audit /\n//     update / board / transition branches.\n//   - This node EXPANDS to N items, one per link to be created.\n//\n// PM's local ids (`s1`, `s2`, …) are only unique within an Epic, so the map\n// is keyed by `<epicKey>::<localId>`. Stories that don't declare a\n// `depends_on`, or declare ones we can't resolve (PM hallucinated a sibling\n// id that doesn't exist), are silently skipped — better to ship the rest of\n// the decomposition than fail the entire Epic. The Code node sits on the\n// happy path, so failures here mean ZERO output items and the downstream\n// HTTP node is a no-op (n8n treats no-input HTTP nodes as success).\n//\n// Direction of the Jira link — read this before touching the downstream POST.\n// The \"Blocks\" link type configures inward=\"is blocked by\", outward=\"blocks\".\n// Atlassian's support KB famously claims \"outwardIssue = the blocker\", which\n// is WRONG and contradicts both the canonical issue-linking-model docs and\n// the official jira-python client. The verifiable contract (matching what\n// Jira actually stores and renders):\n//   inwardIssue.key  = the BLOCKER  (the issue \"to link from\", the source).\n//   outwardIssue.key = the BLOCKED  (the issue \"to link to\",   the target).\n// Sanity check: when you GET the blocked issue (e.g. THING-1), the link in\n// its `issueLinks` array reports the blocker via `inwardIssue: FEAT-1` and\n// the UI labels it `type.inward = \"is blocked by\"` — i.e., the blocker is\n// stored at the inward position. We pre-empted that confusion in our naming:\n//   blockerKey → goes into POST body as inwardIssue\n//   blockedKey → goes into POST body as outwardIssue\n// If you ever see links pointing backwards in Jira's UI after editing this\n// node, the swap was probably reverted. Re-read this comment before flipping.\n\nconst parsed = $('Parse PM output').all();\nconst created = $('Jira — create Story (REST)').all();\n\nconst idToKey = new Map();\nlet createdIdx = 0;\nfor (const it of parsed) {\n  const j = it.json;\n  if (j.kind !== 'story') continue;\n  const epicKey = j.epic && j.epic.key;\n  const localId = j.story && j.story.localId;\n  const jiraKey = created[createdIdx] && created[createdIdx].json && created[createdIdx].json.key;\n  if (epicKey && localId && jiraKey) {\n    idToKey.set(epicKey + '::' + localId, jiraKey);\n  }\n  createdIdx++;\n}\n\n// Downstream HTTP node pulls `apiBase` via cross-node ref to `Set Jira\n// workspace`, so we don't need to thread it through each item here.\nconst out = [];\nfor (const it of parsed) {\n  const j = it.json;\n  if (j.kind !== 'story') continue;\n  const epicKey = j.epic && j.epic.key;\n  const blockedKey = idToKey.get(epicKey + '::' + (j.story && j.story.localId));\n  if (!blockedKey) continue;\n  const deps = (j.story && Array.isArray(j.story.depends_on)) ? j.story.depends_on : [];\n  for (const dep of deps) {\n    const blockerKey = idToKey.get(epicKey + '::' + dep);\n    if (!blockerKey || blockerKey === blockedKey) continue;\n    out.push({\n      json: {\n        epicKey,\n        blockerKey,\n        blockedKey,\n        blockerLocalId: dep,\n        blockedLocalId: j.story.localId,\n      },\n    });\n  }\n}\nreturn out;\n"
+      },
+      "id": "22222222-2222-2222-2222-2222222200a0",
+      "name": "Build issue link specs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2140, 760]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issueLink",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: { name: 'Blocks' }, inwardIssue: { key: $json.blockerKey }, outwardIssue: { key: $json.blockedKey } }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-2222222200a1",
+      "name": "Jira — link Story blockers",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 760],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fold every Story-creation response back into a single item per Epic so\n// the downstream Jira nodes (audit comment, board move, transition, Epic\n// totals) fire exactly once per Epic instead of once per Story.\n//\n// Architecture note — why no SplitInBatches loop:\n//   We used to wrap `Jira — create Story (REST)` in a SplitInBatches(batchSize=1)\n//   loop, but that introduced a subtle data-loss bug: any reference to a\n//   node located INSIDE the loop body, when read from OUTSIDE the loop via\n//   `$('NodeName').all()`, returns only the items from the FINAL iteration,\n//   not the accumulated outputs across all iterations. This Code node sits\n//   outside the loop, so `$('Jira — create Story (REST)').all()` would\n//   return a single-item array (the last Story response), and only that\n//   Story would end up in `storyKeys` / be moved to the board — all earlier\n//   creations were silently dropped. Removing the loop makes n8n process\n//   the N create-Story items serially through a single HTTP node execution\n//   pass; that node then emits N outputs, which we collect here. Jira tier-\n//   1 rate limit (~10 req/s) easily absorbs 10 stories per Epic per minute\n//   so no throttle wrapper is needed.\n//\n// Inputs we read by cross-node reference:\n//   - 'Parse PM output': N items, one per Story, with epic context attached.\n//   - 'Jira — create Story (REST)': N items, the Atlassian create responses\n//     ({ id, key, self }), aligned 1:1 by index with Parse PM output's\n//     `kind === 'story'` items because n8n preserves order through HTTP\n//     nodes when processing multiple input items.\n//\n// Output: one item per distinct Epic, carrying:\n//   - epic / domain / apiBase / projectKey context\n//   - storyKeys (array of newly created Story keys) and storyCount\n//   - inputTokensTotal / outputTokensTotal — sums of PM's per-Story estimates,\n//     written back to the parent Epic's `customfield_10043`/`customfield_10044`\n//     by a downstream PUT so the Epic shows the total cost preview before any\n//     Dev/QA agent picks the Stories up. The same custom fields are reused\n//     across issue types: on a Story they hold the Story's own estimate,\n//     on an Epic they hold the sum of children.\n\nconst parsed = $('Parse PM output').all();\nconst created = $('Jira — create Story (REST)').all();\nconst byEpic = new Map();\nlet createdIdx = 0;\nfor (const it of parsed) {\n  const j = it.json;\n  if (j.kind !== 'story') continue;\n  const ek = j.epic?.key;\n  if (!ek) { createdIdx++; continue; }\n  if (!byEpic.has(ek)) {\n    byEpic.set(ek, {\n      epic: j.epic,\n      domain: j.domain,\n      apiBase: j.apiBase,\n      projectKey: j.projectKey,\n      // PM-rewritten Epic description (ADF form, ready for Jira PUT) and the\n      // original human-authored text (plain string, ready for an audit\n      // comment). Both are per-epic, identical across this Epic's story\n      // items, so we capture them on the first sighting.\n      epicDescriptionAdf: j.epicDescriptionAdf || null,\n      epicOriginalDescription: (j.epic && j.epic.description) || '',\n      storyKeys: [],\n      inputTokensTotal: 0,\n      outputTokensTotal: 0,\n    });\n  }\n  const entry = byEpic.get(ek);\n  const createdKey = created[createdIdx]?.json?.key;\n  if (createdKey) entry.storyKeys.push(createdKey);\n  entry.inputTokensTotal += Math.max(0, Number(j.story?.estimate_input_tokens) || 0);\n  entry.outputTokensTotal += Math.max(0, Number(j.story?.estimate_output_tokens) || 0);\n  createdIdx++;\n}\nreturn Array.from(byEpic.values()).map(v => ({ json: { ...v, storyCount: v.storyKeys.length } }));\n"
+      },
+      "id": "22222222-2222-2222-2222-222222220013",
+      "name": "One item per Epic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2140, 460]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/2/issue/{{ $json.epic.key }}/comment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: 'PM ' + ($json.epicDescriptionAdf ? 'rewrote this Epic\\'s description and ' : '') + 'decomposed it into ' + ($json.storyCount || 0) + ' Stories: ' + (($json.storyKeys || []).join(', ') || '(none)') + '. Estimated tokens (sum across children): ' + ($json.inputTokensTotal || 0) + ' input / ' + ($json.outputTokensTotal || 0) + ' output.' + ($json.epicDescriptionAdf && $json.epicOriginalDescription ? '\\n\\nOriginal Epic description as filed by ' + ($json.epic && $json.epic.author && $json.epic.author.accountId ? '[~accountid:' + $json.epic.author.accountId + ']' : 'the human') + ' (preserved here in case PM misread; edit the Epic to override):\\n{quote}\\n' + $json.epicOriginalDescription + '\\n{quote}' : '') }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-22222222001a",
+      "name": "Jira — audit comment on Epic",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 320],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issue/{{ $json.epic.key }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fields: Object.assign({ 'customfield_10043': $json.inputTokensTotal || 0, 'customfield_10044': $json.outputTokensTotal || 0 }, $json.epicDescriptionAdf ? { description: $json.epicDescriptionAdf } : {}) }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-22222222001e",
+      "name": "Jira — update Epic (description + token totals)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 460],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/agile/1.0/board?projectKeyOrId={{ $json.projectKey }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-22222222001b",
+      "name": "Jira — list boards for project",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 600],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Pick the right board for the Epic's project. The agile API returns\n// every board scoped to a project (often several: kanban + scrum + custom\n// JQL boards); we want the kanban one because the rest of the workflow\n// assumes Kanban semantics (no sprint API, direct backlog-to-board moves).\n//\n// `One item per Epic` and this HTTP node both produce one item per Epic in\n// the same order — n8n preserves order through HTTP nodes, so item[i] here\n// pairs with item[i] from upstream.\n//\n// Optimization opportunity (deferred): cache resolved boards in\n// `$getWorkflowStaticData('global').boardByProject` so we skip the GET\n// after the first hit per project. For one or two projects the savings are\n// marginal (~50ms per 60s poll) and the IF/Merge plumbing required to do\n// conditional fetch isn't worth the workflow complexity right now. Add the\n// cache here when the project count climbs.\n\nconst httpItems = $input.all();\nconst upstream = $('One item per Epic').all();\nconst out = [];\nfor (let i = 0; i < httpItems.length; i++) {\n  const ctx = upstream[i] && upstream[i].json ? upstream[i].json : {};\n  const projectKey = ctx.projectKey || '';\n  const values = (httpItems[i].json && httpItems[i].json.values) || [];\n  const kanban = values.find((b) => b.type === 'kanban');\n  const board = kanban || values[0];\n  if (!board) {\n    throw new Error(`No agile boards returned for project ${projectKey || '(unknown)'}. Check that the project has a Kanban or Scrum board attached, and that awp-pm has read access to it.`);\n  }\n  out.push({\n    json: {\n      ...ctx,\n      boardId: board.id,\n      boardName: board.name,\n      boardType: board.type,\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "22222222-2222-2222-2222-22222222001c",
+      "name": "Pick board for project",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2620, 600]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/agile/1.0/board/{{ $json.boardId }}/issue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ issues: $json.storyKeys || [] }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-22222222001d",
+      "name": "Jira — move Stories to board",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2860, 600],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issue/{{ $json.epic.key }}/transitions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220015",
+      "name": "Jira — list Epic transitions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 760],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Find the transition that lands on status \"In Progress\". Atlassian's GET\n// transitions endpoint returns the *currently available* transitions for\n// the issue, each with `id`, `name`, and `to: { id, name }`. We match on\n// `to.name === 'In Progress'` first (most reliable), then fall back to the\n// transition's own `name`. If none is found we surface a clear error so the\n// user can adjust their workflow (e.g. add an explicit transition into\n// In Progress for Epics).\n\nconst httpItems = $input.all();\nconst upstream = $('One item per Epic').all();\nconst out = [];\n\nfor (let i = 0; i < httpItems.length; i++) {\n  const transitions = httpItems[i].json.transitions || [];\n  const target =\n    transitions.find((t) => t.to && t.to.name === 'In Progress') ||\n    transitions.find((t) => t.name === 'In Progress');\n  const ctx = upstream[i] && upstream[i].json ? upstream[i].json : { epic: { key: 'UNKNOWN' }, domain: '' };\n  if (!target) {\n    const names = transitions.map((t) => `${t.name} → ${t.to && t.to.name}`).join(', ');\n    throw new Error(\n      `No \\\"In Progress\\\" transition available for ${ctx.epic.key}. Available transitions: ${names || '(none)'}.`\n    );\n  }\n  out.push({\n    json: {\n      epic: ctx.epic,\n      domain: ctx.domain,\n      transitionId: target.id,\n      transitionName: target.name,\n    },\n  });\n}\nreturn out;\n"
+      },
+      "id": "22222222-2222-2222-2222-222222220016",
+      "name": "Pick \"In Progress\" transition",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2620, 760]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Set Jira workspace').first().json.apiBase }}/rest/api/3/issue/{{ $json.epic.key }}/transitions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Accept", "value": "application/json" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ transition: { id: $json.transitionId } }) }}",
+        "options": {}
+      },
+      "id": "22222222-2222-2222-2222-222222220014",
+      "name": "Jira — Epic To Do → In Progress",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2860, 760],
+      "continueOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "jira:awp-pm"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every minute": {
+      "main": [[{ "node": "Set Jira workspace", "type": "main", "index": 0 }]]
+    },
+    "Set Jira workspace": {
+      "main": [[{ "node": "Jira — search PM-assigned Epics", "type": "main", "index": 0 }]]
+    },
+    "Jira — search PM-assigned Epics": {
+      "main": [[{ "node": "Prep Epic + prompt", "type": "main", "index": 0 }]]
+    },
+    "Prep Epic + prompt": {
+      "main": [[{ "node": "PM Agent", "type": "main", "index": 0 }]]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [[{ "node": "PM Agent", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "PM Agent": {
+      "main": [[{ "node": "Parse PM output", "type": "main", "index": 0 }]]
+    },
+    "Parse PM output": {
+      "main": [[{ "node": "Needs clarification?", "type": "main", "index": 0 }]]
+    },
+    "Needs clarification?": {
+      "main": [
+        [{ "node": "Jira — label Epic Needs_Clarification", "type": "main", "index": 0 }],
+        [{ "node": "Jira — create Story (REST)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Jira — label Epic Needs_Clarification": {
+      "main": [[{ "node": "Jira — comment with questions", "type": "main", "index": 0 }]]
+    },
+    "Jira — create Story (REST)": {
+      "main": [[
+        { "node": "One item per Epic", "type": "main", "index": 0 },
+        { "node": "Build issue link specs", "type": "main", "index": 0 }
+      ]]
+    },
+    "Build issue link specs": {
+      "main": [[{ "node": "Jira — link Story blockers", "type": "main", "index": 0 }]]
+    },
+    "One item per Epic": {
+      "main": [[
+        { "node": "Jira — audit comment on Epic", "type": "main", "index": 0 },
+        { "node": "Jira — update Epic (description + token totals)", "type": "main", "index": 0 },
+        { "node": "Jira — list boards for project", "type": "main", "index": 0 },
+        { "node": "Jira — list Epic transitions", "type": "main", "index": 0 }
+      ]]
+    },
+    "Jira — list boards for project": {
+      "main": [[{ "node": "Pick board for project", "type": "main", "index": 0 }]]
+    },
+    "Pick board for project": {
+      "main": [[{ "node": "Jira — move Stories to board", "type": "main", "index": 0 }]]
+    },
+    "Jira — list Epic transitions": {
+      "main": [[{ "node": "Pick \"In Progress\" transition", "type": "main", "index": 0 }]]
+    },
+    "Pick \"In Progress\" transition": {
+      "main": [[{ "node": "Jira — Epic To Do → In Progress", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {}
+}

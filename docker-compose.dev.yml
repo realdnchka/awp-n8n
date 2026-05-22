@@ -65,9 +65,14 @@ services:
       N8N_API_KEY: ${N8N_API_KEY:-}
       N8N_URL: http://n8n:5678
       WORKFLOWS_DIR: /workflows
+      # Workflow JSONs may contain {{INCLUDE:relative/path}} markers that the
+      # sidecar replaces with file contents (JS-escaped) before pushing to
+      # n8n's REST API. Resolved relative to INCLUDE_BASE_DIR.
+      INCLUDE_BASE_DIR: /home/node/awp-agents
     volumes:
       - ./n8n/workflows:/workflows:ro
       - ./scripts/sync-workflows.js:/scripts/sync-workflows.js:ro
+      - ../awp-agents:/home/node/awp-agents:ro
     networks:
       - awp
     entrypoint: ["node", "/scripts/sync-workflows.js"]

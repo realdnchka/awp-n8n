@@ -26,6 +26,58 @@ const path = require('path');
 const apiKey = process.env.N8N_API_KEY;
 const baseUrl = new URL(process.env.N8N_URL || 'http://n8n:5678');
 const workflowsDir = process.env.WORKFLOWS_DIR || '/workflows';
+const includeBaseDir = process.env.INCLUDE_BASE_DIR || '/home/node/awp-agents';
+
+// Sidecar-side templating: walk every string field in the workflow JSON and
+// replace `{{INCLUDE:relative/path/to/file}}` markers with the JS-string-literal
+// form of the file contents (i.e. surrounded by double quotes, with \n, \", \\
+// etc. escaped). The path is resolved relative to INCLUDE_BASE_DIR and must
+// stay inside it (we reject any path that escapes via ..).
+//
+// Why: n8n 2.21+ runs Code nodes in a Task Runner with binaryDataMode=filesystem.
+// Cross-node binary access does not return the .data field — the upstream
+// Read File node hands the Code node a lazy reference that's useless inside
+// the sandbox. Instead of fighting that, we bake static text files (PM
+// prompt, etc.) directly into Code node source at sync time. Editing the
+// prompt file + re-running this sidecar is the workflow.
+const INCLUDE_RE = /\{\{INCLUDE:([^}]+)\}\}/g;
+
+function jsStringLiteral(text) {
+  // Produce a double-quoted JS string literal: "...". JSON.stringify happens
+  // to do exactly that — JSON strings are a strict subset of JS strings.
+  return JSON.stringify(text);
+}
+
+function resolveInclude(relPath) {
+  const cleaned = relPath.trim();
+  if (!cleaned) throw new Error('Empty include path');
+  const abs = path.resolve(includeBaseDir, cleaned);
+  const baseAbs = path.resolve(includeBaseDir) + path.sep;
+  if (abs !== path.resolve(includeBaseDir) && !abs.startsWith(baseAbs)) {
+    throw new Error(`Include path escapes ${includeBaseDir}: ${relPath}`);
+  }
+  return fs.readFileSync(abs, 'utf8');
+}
+
+function expandIncludes(value, file) {
+  if (typeof value === 'string') {
+    if (!value.includes('{{INCLUDE:')) return value;
+    return value.replace(INCLUDE_RE, (_, p) => {
+      const content = resolveInclude(p);
+      console.log(`[awp-sync] ${file}: inlined ${p.trim()} (${content.length} chars)`);
+      // Emit a JS string literal so the surrounding jsCode reads:
+      //   const x = "<<escaped contents>>";
+      return jsStringLiteral(content);
+    });
+  }
+  if (Array.isArray(value)) return value.map((v) => expandIncludes(v, file));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = expandIncludes(value[k], file);
+    return out;
+  }
+  return value;
+}
 
 if (!apiKey) {
   console.log('[awp-sync] N8N_API_KEY is not set — cannot sync via REST API.');
@@ -87,6 +139,41 @@ function workflowPayload(wf) {
   };
 }
 
+// Walk the workflow's node list and resolve every `credentials` block from
+// (type, name) to (type, name + id). n8n's import API silently drops nodes
+// that reference a credential by name only — at execution time you get
+// "Found credential with no ID". The built-in node types (jiraSoftwareCloudApi,
+// anthropicApi, ...) auto-resolve by name as a legacy compatibility, but
+// generic types like httpHeaderAuth do not. Resolving on the sidecar side
+// keeps workflow JSONs human-readable (no UUID gore) while satisfying n8n.
+function resolveCredentialIds(wf, credByTypeAndName, file) {
+  if (!Array.isArray(wf.nodes)) return wf;
+  let resolved = 0;
+  const missing = [];
+  for (const node of wf.nodes) {
+    if (!node.credentials || typeof node.credentials !== 'object') continue;
+    for (const credType of Object.keys(node.credentials)) {
+      const entry = node.credentials[credType];
+      if (!entry || typeof entry !== 'object' || !entry.name) continue;
+      const key = `${credType}::${entry.name}`;
+      const found = credByTypeAndName.get(key);
+      if (found) {
+        entry.id = found.id;
+        resolved += 1;
+      } else if (!entry.id) {
+        missing.push(`${node.name} → ${credType}:${entry.name}`);
+      }
+    }
+  }
+  if (resolved > 0) {
+    console.log(`[awp-sync] ${file}: resolved ${resolved} credential reference(s) to IDs`);
+  }
+  if (missing.length > 0) {
+    console.log(`[awp-sync] ${file}: WARNING — could not resolve credentials by (type, name): ${missing.join(', ')}. Create them in the n8n UI before this workflow can execute.`);
+  }
+  return wf;
+}
+
 async function main() {
   console.log(`[awp-sync] enumerating workflows at ${baseUrl.origin}`);
   const listResp = await api('GET', '/api/v1/workflows?limit=250');
@@ -95,6 +182,18 @@ async function main() {
   for (const wf of existingList) byName.set(wf.name, wf);
   console.log(`[awp-sync] ${existingList.length} workflow(s) already in n8n`);
 
+  // Pre-load credentials so we can resolve workflow node references by name.
+  // n8n's public API only returns metadata (id/name/type) — no secrets — so
+  // this is safe to do under the sync sidecar's API key.
+  const credResp = await api('GET', '/api/v1/credentials?limit=250');
+  const credList = Array.isArray(credResp) ? credResp : credResp.data || [];
+  const credByTypeAndName = new Map();
+  for (const c of credList) {
+    if (!c || !c.type || !c.name || !c.id) continue;
+    credByTypeAndName.set(`${c.type}::${c.name}`, { id: c.id, type: c.type, name: c.name });
+  }
+  console.log(`[awp-sync] ${credList.length} credential(s) available for name→id resolution`);
+
   const files = fs
     .readdirSync(workflowsDir)
     .filter((f) => f.endsWith('.json'))
@@ -102,11 +201,13 @@ async function main() {
   console.log(`[awp-sync] ${files.length} workflow JSON(s) under ${workflowsDir}`);
 
   for (const file of files) {
-    const wf = JSON.parse(fs.readFileSync(path.join(workflowsDir, file), 'utf8'));
-    if (!wf.name) {
+    const rawWf = JSON.parse(fs.readFileSync(path.join(workflowsDir, file), 'utf8'));
+    if (!rawWf.name) {
       console.log(`[awp-sync] ${file}: no "name" field, skipping`);
       continue;
     }
+    const expanded = expandIncludes(rawWf, file);
+    const wf = resolveCredentialIds(expanded, credByTypeAndName, file);
     const payload = workflowPayload(wf);
 
     let id;

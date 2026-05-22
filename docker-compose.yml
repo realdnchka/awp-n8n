@@ -18,6 +18,27 @@ services:
       N8N_SECURE_COOKIE: "false"
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_PERSONALIZATION_ENABLED: "false"
+      # Allow Code nodes and expressions to read non-secret config from env
+      # (we need JIRA_DOMAIN for workspace-aware REST calls). The default
+      # blocks env access; we explicitly opt in.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # Verbose logs for debugging — every outbound HTTP request from the
+      # workflow runner appears in container stdout. Drop to "info" once the
+      # M1 flow is healthy to reduce noise.
+      N8N_LOG_LEVEL: debug
+      # Atlassian workspace domain (e.g. mycompany.atlassian.net). Used for
+      # human-facing browse URLs in PM comments. The native Jira node has been
+      # replaced with HTTP Request throughout because (a) its create-with-parent
+      # / transition / search behaviour varies across n8n versions, and (b) it
+      # only speaks the .atlassian.net domain — incompatible with the scoped
+      # API tokens that Atlassian service accounts are limited to (see below).
+      JIRA_DOMAIN: ${JIRA_DOMAIN}
+      # Atlassian cloudId for JIRA_DOMAIN. Service-account scoped tokens MUST
+      # be sent to https://api.atlassian.com/ex/jira/<cloudId>/rest/api/...
+      # rather than the workspace domain — Atlassian returns 401 otherwise.
+      # See https://support.atlassian.com/atlassian-cloud/kb/401-unauthorized-error-when-service-account-accesses-jira-or-confluence-api/
+      # Look up once with: curl -s https://<workspace>.atlassian.net/_edge/tenant_info
+      JIRA_CLOUD_ID: ${JIRA_CLOUD_ID}
     volumes:
       - n8n_data:/home/node/.n8n
       - ./n8n/workflows:/home/node/workflows:ro
